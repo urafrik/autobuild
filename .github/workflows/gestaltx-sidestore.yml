@@ -1,0 +1,87 @@
+name: GestaltX SideStore IPA
+on:
+  push:
+    branches: [gestaltx-sidestore-20261110]
+    paths: [.github/workflows/gestaltx-sidestore.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout official source at reviewed commit
+        uses: actions/checkout@v4
+        with:
+          repository: huamidev/GestaltX
+          ref: 36110fd7544ceefdc419e13d337ec515e3ec53dc
+          persist-credentials: false
+      - name: Select newest installed Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          XCODE_APP="$(find /Applications -maxdepth 1 -name 'Xcode*.app' | sort -V | tail -n 1)"
+          test -n "$XCODE_APP"
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          xcodebuild -version
+          xcodebuild -showsdks
+      - name: Build and sign libraries then share extension then app
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/deliverables"
+          bash .github/scripts/build-ipa.sh "$RUNNER_TEMP/deliverables" 2>&1 | tee "$RUNNER_TEMP/deliverables/build.log"
+      - name: Independently verify the packaged IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, plistlib, subprocess, zipfile
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'deliverables'
+          ipa, = out.glob('*.ipa')
+          stage = pathlib.Path(os.environ['RUNNER_TEMP']) / 'verify-ipa'
+          stage.mkdir()
+          with zipfile.ZipFile(ipa) as z:
+              assert z.testzip() is None
+              names = z.namelist()
+              assert len(names) == len(set(names))
+              assert all(not n.startswith('/') and '..' not in pathlib.PurePosixPath(n).parts for n in names)
+              assert {n for n in names if n.endswith('.app/Info.plist')} == {'Payload/GestaltX.app/Info.plist'}
+          subprocess.run(['ditto', '-x', '-k', str(ipa), str(stage)], check=True)
+          app = stage / 'Payload/GestaltX.app'
+          share = app / 'PlugIns/GestaltXShare.appex'
+          assert share.is_dir()
+          subprocess.run(['codesign', '--verify', '--deep', '--strict', '--verbose=2', str(app)], check=True)
+          checks = []
+          for bundle, expected in [(share, 'ShareExtension/GestaltXShare.entitlements'), (app, 'GestaltX/GestaltX.entitlements')]:
+              subprocess.run(['codesign', '--verify', '--strict', str(bundle)], check=True)
+              result = subprocess.run(['codesign', '-d', '--entitlements', '-', '--xml', str(bundle)], capture_output=True, check=True)
+              ent = plistlib.loads(result.stdout)
+              assert ent == plistlib.loads(pathlib.Path(expected).read_bytes()), (str(bundle), ent)
+              assert ent['com.apple.security.application-groups'] == ['group.com.huami.gestultx']
+              meta = subprocess.run(['codesign', '-dvv', str(bundle)], capture_output=True, text=True, check=True).stderr
+              assert 'Signature=adhoc' in meta and 'TeamIdentifier=not set' in meta
+              info = plistlib.loads((bundle / 'Info.plist').read_bytes())
+              assert (bundle / info['CFBundleExecutable']).is_file()
+              (out / (bundle.name + '.entitlements.plist')).write_bytes(result.stdout)
+              checks.append({'bundle':str(bundle.relative_to(stage)), 'bundle_id':info['CFBundleIdentifier'], 'entitlements':ent, 'signature':meta})
+          sha = hashlib.sha256(ipa.read_bytes()).hexdigest()
+          report = {'result':'PASS', 'source_commit':'36110fd7544ceefdc419e13d337ec515e3ec53dc', 'sha256':sha, 'bundles':checks, 'device_installation_tested':False}
+          (out / 'verification.json').write_text(json.dumps(report, indent=2))
+          (out / 'SHA256SUMS.txt').write_text(sha + '  ' + ipa.name + '\n')
+          print(json.dumps(report, indent=2))
+          PY
+      - name: Preserve official source and license
+        if: success()
+        shell: bash
+        run: |
+          git archive --format=zip --output="$RUNNER_TEMP/deliverables/GestaltX-source.zip" HEAD
+          cp LICENSE "$RUNNER_TEMP/deliverables/LICENSE.txt"
+      - name: Upload IPA and verification evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: GestaltX-SideStore-IPA
+          path: ${{ runner.temp }}/deliverables/
+          if-no-files-found: error
+          retention-days: 30
