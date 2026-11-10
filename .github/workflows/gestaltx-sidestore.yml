@@ -26,6 +26,17 @@ jobs:
           sudo xcode-select -s "$XCODE_APP/Contents/Developer"
           xcodebuild -version
           xcodebuild -showsdks
+      - name: Make project readable by runner Xcode
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path('GestaltX.xcodeproj/project.pbxproj')
+          text = p.read_text()
+          assert text.count('objectVersion = 110;') == 1
+          p.write_text(text.replace('objectVersion = 110;', 'objectVersion = 77;'))
+          PY
+          git diff --check
       - name: Build and sign libraries then share extension then app
         shell: bash
         run: |
@@ -77,6 +88,7 @@ jobs:
         shell: bash
         run: |
           git archive --format=zip --output="$RUNNER_TEMP/deliverables/GestaltX-source.zip" HEAD
+          git diff --binary > "$RUNNER_TEMP/deliverables/source-changes.patch"
           cp LICENSE "$RUNNER_TEMP/deliverables/LICENSE.txt"
       - name: Upload IPA and verification evidence
         uses: actions/upload-artifact@v4
